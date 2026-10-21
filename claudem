@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ClaudeM — Claude Code Persistent Session Manager (No-Permission Mode)
+Runs and manages persistent background Claude Code sessions in Tmux.
+"""
+
+import sys
+import os
+import json
+import time
+import shutil
+import subprocess
+from datetime import datetime, timedelta
+
+def get_default_data_dir():
+    # If running as root, prefer /var/lib/claudem if accessible, else ~/.local/share/claudem
+    try:
+        if os.geteuid() == 0:
+            return "/var/lib/claudem"
+    except AttributeError:
+        pass
+    return os.path.expanduser("~/.local/share/claudem")
+
+DATA_DIR = os.environ.get("CLAUDEM_DATA_DIR", get_default_data_dir())
+SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
+DEFAULT_TTL_HOURS = 12
+
+# Terminal colors
+BOLD = "\033[1m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+RED = "\033[31m"
+MAGENTA = "\033[35m"
+RESET = "\033[0m"
+DIM = "\033[2m"
+
+def init_env():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except PermissionError:
+        # Fallback to home directory if /var/lib/claudem is not writable
+        fallback_dir = os.path.expanduser("~/.local/share/claudem")
+        os.makedirs(fallback_dir, exist_ok=True)
+        globals()["DATA_DIR"] = fallback_dir
+        globals()["SESSIONS_FILE"] = os.path.join(fallback_dir, "sessions.json")
+
+    if not os.path.exists(SESSIONS_FILE):
+        try:
+            with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+        except Exception:
+            pass
+
+def load_sessions():
+    init_env()
+    try:
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_sessions(sessions):
+    init_env()
+    temp_file = SESSIONS_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(sessions, f, indent=2, ensure_ascii=False)
+    os.replace(temp_file, SESSIONS_FILE)
+
+def find_claude_binary():
+    candidates = [
+        shutil.which("claude"),
+        os.path.expanduser("~/.local/bin/claude"),
+        "/usr/local/bin/claude",
+        "/usr/bin/claude",
+        "/root/.local/bin/claude"
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return "claude"
+
+def trust_directory(path):
+    """Mark workspace directory as trusted in Claude Code configuration to prevent trust prompts."""
+    path = os.path.abspath(path)
+    claude_json_paths = [
+        os.path.expanduser("~/.claude.json"),
+        "/root/.claude.json"
+    ]
+    for cjp in set(claude_json_paths):
+        if not os.path.exists(cjp):
+            continue
+        try:
+            with open(cjp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            projects = data.setdefault("projects", {})
+            proj = projects.setdefault(path, {})
+            if not proj.get("hasTrustDialogAccepted"):
+                proj["hasTrustDialogAccepted"] = True
+                with open(cjp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+def is_tmux_session_running(name):
+    res = subprocess.run(["tmux", "has-session", "-t", name],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return res.returncode == 0
+
+def kill_tmux_session(name):
+    subprocess.run(["tmux", "kill-session", "-t", name],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def format_time_remaining(seconds_left):
+    if seconds_left <= 0:
+        return f"{RED}Abgelaufen{RESET}"
+    td = timedelta(seconds=int(seconds_left))
+    days = td.days
+    hours, remainder = divmod(td.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes:02d}m")
+    parts.append(f"{seconds:02d}s")
+    
+    time_str = " ".join(parts)
+    if seconds_left < 3600:
+        return f"{RED}{time_str}{RESET}"
+    elif seconds_left < 7200:
+        return f"{YELLOW}{time_str}{RESET}"
+    return f"{GREEN}{time_str}{RESET}"
+
+def cleanup_expired_sessions(quiet=True):
+    sessions = load_sessions()
+    now = time.time()
+    changed = False
+    cleaned_ids = []
+
+    for sid, data in list(sessions.items()):
+        tmux_name = data.get("tmux_name", f"claudem-{sid}")
+        expires_at = data.get("expires_at", 0)
+        
+        # Check if expired or dead
+        is_expired = now >= expires_at
+        is_alive = is_tmux_session_running(tmux_name)
+        
+        if is_expired or not is_alive:
+            if is_alive:
+                kill_tmux_session(tmux_name)
+            del sessions[sid]
+            changed = True
+            cleaned_ids.append((sid, "abgelaufen" if is_expired else "beendet"))
+
+    if changed:
+        save_sessions(sessions)
+        if not quiet and cleaned_ids:
+            for sid, reason in cleaned_ids:
+                print(f"{DIM}[ClaudeM Cleaner] Sitzung #{sid} ({reason}) entfernt.{RESET}")
+
+def get_next_session_id(sessions):
+    sid = 1
+    while str(sid) in sessions:
+        sid += 1
+    return sid
+
+# ─────────────────────────────────────────────────────────────
+# Subcommands
+# ─────────────────────────────────────────────────────────────
+
+def cmd_help(args=None):
+    print(f"""
+{BOLD}{CYAN}⚡ ClaudeM — Claude Code Session Manager (No-Permission Mode) ⚡{RESET}
+
+{BOLD}BESCHREIBUNG:{RESET}
+  Startet und verwaltet Claude Code Sitzungen im automatischen No-Permission-Modus.
+  Die Sitzungen laufen im Hintergrund in einer persistenten Tmux-Session weiter,
+  selbst wenn du dich per SSH trennst oder die Verbindung abbricht.
+
+{BOLD}BEFEHLE:{RESET}
+  {GREEN}ClaudeM help{RESET}
+      Zeigt diese Hilfeseite mit allen Optionen an.
+
+  {GREEN}ClaudeM start [Pfad] [--hours H]{RESET}
+      Startet eine neue Claude Code Sitzung.
+      • Standard-Arbeitsverzeichnis: Aktuelles Verzeichnis
+      • Standard-Laufzeit: 12 Stunden (automatische Löschung nach Ablauf)
+      • Bypass-Permissions (--dangerously-skip-permissions) automatisch aktiv.
+
+  {GREEN}ClaudeM list{RESET} (oder {GREEN}ClaudeM List{RESET})
+      Listet alle aktuell laufenden Sitzungen inklusive Nummer, Restzeit,
+      Ablaufdatum und Befehl zum Beitreten auf.
+
+  {GREEN}ClaudeM renew <Nummer> [Stunden]{RESET}
+      Verlängert die Lebensdauer einer aktiven Sitzung.
+      • Standard-Verlängerung: +12 Stunden (z.B. für 24h Gesamtlaufzeit)
+      • Beispiel: {CYAN}ClaudeM renew 1{RESET}   (Verlängert Sitzung #1 um 12h)
+      • Beispiel: {CYAN}ClaudeM renew 1 24{RESET} (Verlängert Sitzung #1 um 24h)
+
+  {GREEN}ClaudeM attach <Nummer>{RESET}
+      Verbindet dich direkt mit der interaktiven Tmux-Sitzung.
+      (Tipp: Wenn nur eine Sitzung aktiv ist, genügt {CYAN}ClaudeM attach{RESET})
+
+  {GREEN}ClaudeM stop <Nummer>{RESET} (oder {GREEN}kill <Nummer>{RESET})
+      Beendet eine Sitzung sofort und gibt alle Ressourcen frei.
+
+  {GREEN}ClaudeM logs <Nummer>{RESET}
+      Zeigt die letzten Terminalausgaben der Sitzung an, ohne ihr beizutreten.
+
+{BOLD}BEDIENUNG IN DER SITZUNG:{RESET}
+  • {BOLD}Trennen ohne zu Beenden (Detach):{RESET} Drücke {YELLOW}Strg + B{RESET}, gefolgt von {YELLOW}D{RESET}.
+  • Die Sitzung bleibt im Hintergrund voll funktionsfähig und arbeitet weiter!
+  • Erneutes Beitreten jederzeit mit {CYAN}ClaudeM attach <Nummer>{RESET}.
+""")
+
+def cmd_start(args):
+    cleanup_expired_sessions(quiet=True)
+    sessions = load_sessions()
+    
+    # Parse target directory and hours
+    target_dir = os.getcwd()
+    hours = DEFAULT_TTL_HOURS
+    
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if arg in ["--hours", "-h"] and idx + 1 < len(args):
+            try:
+                hours = float(args[idx + 1])
+                idx += 2
+                continue
+            except ValueError:
+                pass
+        elif not arg.startswith("-"):
+            if os.path.isdir(arg):
+                target_dir = os.path.abspath(arg)
+            else:
+                try:
+                    # check if numeric hours
+                    hours = float(arg)
+                    idx += 1
+                    continue
+                except ValueError:
+                    target_dir = os.path.abspath(arg)
+        idx += 1
+
+    if not os.path.exists(target_dir):
+        print(f"{RED}Fehler: Verzeichnis '{target_dir}' existiert nicht.{RESET}")
+        sys.exit(1)
+
+    sid = get_next_session_id(sessions)
+    tmux_name = f"claudem-{sid}"
+    
+    claude_bin = find_claude_binary()
+    trust_directory(target_dir)
+
+    now = time.time()
+    expires_at = now + (hours * 3600)
+    
+    # Wrapper script inside tmux to handle colors, environment, and error pauses
+    # Note: IS_SANDBOX=1 is essential so Claude Code bypasses root-user prevention for --dangerously-skip-permissions!
+    shell_cmd = (
+        f"export IS_SANDBOX=1; "
+        f"export TERM=xterm-256color; "
+        f"cd {target_dir} && "
+        f"{claude_bin} --dangerously-skip-permissions; "
+        f"echo; "
+        f"echo -e '{YELLOW}[ClaudeM: Claude Code beendet. Drücke Enter zum Schließen des Fensters]{RESET}'; "
+        f"read -r"
+    )
+
+    tmux_create_cmd = [
+        "tmux", "new-session", "-d",
+        "-s", tmux_name,
+        "-c", target_dir,
+        "bash", "-c", shell_cmd
+    ]
+
+    res = subprocess.run(tmux_create_cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"{RED}Fehler beim Erstellen der Tmux-Sitzung:{RESET}\n{res.stderr}")
+        sys.exit(1)
+
+    # Save session
+    sessions[str(sid)] = {
+        "id": sid,
+        "tmux_name": tmux_name,
+        "workdir": target_dir,
+        "created_at": now,
+        "expires_at": expires_at,
+        "ttl_hours": hours,
+        "status": "running"
+    }
+    save_sessions(sessions)
+
+    expire_dt = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S")
+    time_left_str = format_time_remaining(expires_at - now)
+
+    print(f"""
+{BOLD}{GREEN}✓ Claude Code Sitzung #{sid} erfolgreich gestartet!{RESET}
+────────────────────────────────────────────────────────────────────────
+  {BOLD}Sitzungs-ID:{RESET}       {CYAN}#{sid}{RESET}  (Tmux: {tmux_name})
+  {BOLD}Verzeichnis:{RESET}       {target_dir}
+  {BOLD}Berechtigungen:{RESET}    {MAGENTA}No-Permission Modus (--dangerously-skip-permissions){RESET}
+  {BOLD}Laufzeit:{RESET}          {hours:.1f} Stunden (Verbleibend: {time_left_str})
+  {BOLD}Läuft ab am:{RESET}       {YELLOW}{expire_dt}{RESET} (Automatische Löschung)
+────────────────────────────────────────────────────────────────────────
+  {BOLD}👉 Sitzung beitreten:{RESET}  {BOLD}{GREEN}ClaudeM attach {sid}{RESET}
+  {BOLD}👉 Sitzung trennen:{RESET}   {YELLOW}Strg + B{RESET}, dann {YELLOW}D{RESET}  (bleibt im Hintergrund aktiv!)
+  {BOLD}👉 Verlängern:{RESET}        {BOLD}{CYAN}ClaudeM renew {sid}{RESET}  (+12h)
+────────────────────────────────────────────────────────────────────────
+""")
+
+def cmd_list(args=None):
+    cleanup_expired_sessions(quiet=True)
+    sessions = load_sessions()
+    
+    if not sessions:
+        print(f"\n{YELLOW}Keine aktiven Claude Code Sitzungen vorhanden.{RESET}")
+        print(f"Starte eine neue Sitzung mit: {GREEN}ClaudeM start{RESET}\n")
+        return
+
+    now = time.time()
+    print(f"\n{BOLD}{CYAN}⚡ Aktive ClaudeM Sitzungen ({len(sessions)}) ⚡{RESET}")
+    print("═" * 86)
+    header = f"{'Nr':<4} {'Status':<10} {'Restzeit':<18} {'Ablaufzeit':<20} {'Pfad / Befehl'}"
+    print(f"{BOLD}{header}{RESET}")
+    print("─" * 86)
+
+    for sid in sorted(sessions.keys(), key=lambda x: int(x)):
+        data = sessions[sid]
+        tmux_name = data.get("tmux_name", f"claudem-{sid}")
+        workdir = data.get("workdir", "-")
+        expires_at = data.get("expires_at", 0)
+        seconds_left = expires_at - now
+        
+        status_str = f"{GREEN}Aktiv{RESET}" if is_tmux_session_running(tmux_name) else f"{RED}Beendet{RESET}"
+        expire_dt = datetime.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M")
+        time_left_str = format_time_remaining(seconds_left)
+        
+        # Format compact row
+        print(f"{BOLD}#{sid:<3}{RESET} {status_str:<19} {time_left_str:<27} {expire_dt:<20} {workdir}")
+        print(f"     {DIM}↳ Beitreten mit:{RESET} {BOLD}{GREEN}ClaudeM attach {sid}{RESET}  {DIM}| Verlängern:{RESET} {CYAN}ClaudeM renew {sid}{RESET}")
+        print("─" * 86)
+
+    print(f"{DIM}Tipp: Zum Trennen ohne Beenden im Terminal [Strg+B] dann [D] drücken.{RESET}\n")
+
+def cmd_renew(args):
+    cleanup_expired_sessions(quiet=True)
+    sessions = load_sessions()
+
+    if not args:
+        print(f"{RED}Fehler: Bitte gib die Sitzungsnummer an.{RESET}")
+        print(f"Beispiel: {GREEN}ClaudeM renew 1{RESET} oder {GREEN}ClaudeM renew 1 24{RESET}")
+        cmd_list()
+        sys.exit(1)
+
+    sid = args[0].lstrip("#")
+    if sid not in sessions:
+        print(f"{RED}Fehler: Sitzung #{sid} nicht gefunden oder bereits abgelaufen.{RESET}")
+        cmd_list()
+        sys.exit(1)
+
+    hours = DEFAULT_TTL_HOURS
+    if len(args) > 1:
+        try:
+            hours = float(args[1])
+        except ValueError:
+            print(f"{YELLOW}Ungültige Stundenangabe '{args[1]}', verwende Standard ({DEFAULT_TTL_HOURS}h).{RESET}")
+
+    now = time.time()
+    current_expires = sessions[sid].get("expires_at", now)
+    
+    # Extend from current expiration (or from now if expired)
+    base_time = max(current_expires, now)
+    new_expires = base_time + (hours * 3600)
+    sessions[sid]["expires_at"] = new_expires
+    save_sessions(sessions)
+
+    expire_dt = datetime.fromtimestamp(new_expires).strftime("%Y-%m-%d %H:%M:%S")
+    time_left_str = format_time_remaining(new_expires - now)
+
+    print(f"""
+{BOLD}{GREEN}✓ Sitzung #{sid} erfolgreich um {hours:.1f} Stunden verlängert!{RESET}
+────────────────────────────────────────────────────────────────────────
+  {BOLD}Neue Ablaufzeit:{RESET}     {YELLOW}{expire_dt}{RESET}
+  {BOLD}Verbleibend:{RESET}         {time_left_str}
+  {BOLD}Sitzung beitreten:{RESET}   {BOLD}{GREEN}ClaudeM attach {sid}{RESET}
+────────────────────────────────────────────────────────────────────────
+""")
+
+def cmd_attach(args):
+    cleanup_expired_sessions(quiet=True)
+    sessions = load_sessions()
+
+    if not sessions:
+        print(f"{YELLOW}Keine aktiven Claude Code Sitzungen vorhanden.{RESET}")
+        print(f"Starte eine mit: {GREEN}ClaudeM start{RESET}")
+        sys.exit(1)
+
+    if not args:
+        if len(sessions) == 1:
+            sid = next(iter(sessions.keys()))
+            print(f"{DIM}Verbinde automatisch mit der einzigen aktiven Sitzung #{sid}...{RESET}")
+        else:
+            print(f"{RED}Fehler: Mehrere Sitzungen aktiv. Bitte Nummer angeben:{RESET}")
+            cmd_list()
+            sys.exit(1)
+    else:
+        sid = args[0].lstrip("#")
+
+    if sid not in sessions:
+        print(f"{RED}Fehler: Sitzung #{sid} existiert nicht.{RESET}")
+        cmd_list()
+        sys.exit(1)
+
+    tmux_name = sessions[sid].get("tmux_name", f"claudem-{sid}")
+    if not is_tmux_session_running(tmux_name):
+        print(f"{RED}Fehler: Tmux-Sitzung '{tmux_name}' läuft nicht mehr.{RESET}")
+        cleanup_expired_sessions(quiet=True)
+        sys.exit(1)
+
+    # Attach to tmux session
+    print(f"{CYAN}Verbinde mit Sitzung #{sid} ({tmux_name})... (Trennen mit [Strg+B] gefolgt von [D]){RESET}")
+    time.sleep(0.5)
+    os.execvp("tmux", ["tmux", "attach-session", "-t", tmux_name])
+
+def cmd_stop(args):
+    sessions = load_sessions()
+    if not args:
+        print(f"{RED}Fehler: Bitte Sitzungsnummer angeben (z.B. ClaudeM stop 1).{RESET}")
+        cmd_list()
+        sys.exit(1)
+
+    sid = args[0].lstrip("#")
+    if sid not in sessions:
+        print(f"{RED}Fehler: Sitzung #{sid} nicht gefunden.{RESET}")
+        sys.exit(1)
+
+    tmux_name = sessions[sid].get("tmux_name", f"claudem-{sid}")
+    kill_tmux_session(tmux_name)
+    del sessions[sid]
+    save_sessions(sessions)
+
+    print(f"{GREEN}✓ Sitzung #{sid} ({tmux_name}) wurde beendet und gelöscht.{RESET}")
+
+def cmd_logs(args):
+    sessions = load_sessions()
+    if not args:
+        print(f"{RED}Fehler: Bitte Sitzungsnummer angeben (z.B. ClaudeM logs 1).{RESET}")
+        sys.exit(1)
+
+    sid = args[0].lstrip("#")
+    if sid not in sessions:
+        print(f"{RED}Fehler: Sitzung #{sid} nicht gefunden.{RESET}")
+        sys.exit(1)
+
+    tmux_name = sessions[sid].get("tmux_name", f"claudem-{sid}")
+    if not is_tmux_session_running(tmux_name):
+        print(f"{RED}Sitzung #{sid} läuft nicht mehr.{RESET}")
+        return
+
+    lines = 30
+    if len(args) > 1:
+        try:
+            lines = int(args[1])
+        except ValueError:
+            pass
+
+    res = subprocess.run(["tmux", "capture-pane", "-p", "-t", tmux_name, "-S", f"-{lines}"],
+                         capture_output=True, text=True)
+    if res.returncode == 0:
+        print(f"\n{BOLD}{CYAN}--- Letzte {lines} Zeilen von Sitzung #{sid} ---{RESET}")
+        print(res.stdout.rstrip())
+        print(f"{BOLD}{CYAN}---------------------------------------------{RESET}\n")
+    else:
+        print(f"{RED}Konnte Logs nicht abrufen.{RESET}")
+
+def cmd_cleanup():
+    cleanup_expired_sessions(quiet=False)
+
+# ─────────────────────────────────────────────────────────────
+# Main Router
+# ─────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2:
+        cmd_list()
+        return
+
+    command = sys.argv[1].lower()
+    args = sys.argv[2:]
+
+    if command in ["help", "--help", "-h", "?"]:
+        cmd_help(args)
+    elif command in ["start", "new", "run"]:
+        cmd_start(args)
+    elif command in ["list", "ls", "status"]:
+        cmd_list(args)
+    elif command in ["renew", "extend"]:
+        cmd_renew(args)
+    elif command in ["attach", "join", "connect", "a"]:
+        cmd_attach(args)
+    elif command in ["stop", "kill", "rm", "delete"]:
+        cmd_stop(args)
+    elif command in ["logs", "log"]:
+        cmd_logs(args)
+    elif command in ["cleanup", "cron"]:
+        cmd_cleanup()
+    else:
+        print(f"{RED}Unbekannter Befehl: '{sys.argv[1]}'{RESET}")
+        print(f"Führe {GREEN}ClaudeM help{RESET} aus, um alle Befehle zu sehen.")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
