@@ -185,11 +185,15 @@ def cmd_help(args=None):
   {GREEN}ClaudeM help{RESET}
       Zeigt diese Hilfeseite mit allen Optionen an.
 
-  {GREEN}ClaudeM start [Pfad] [--hours H]{RESET}
+  {GREEN}ClaudeM start [Pfad] [--hours H] [--resume]{RESET}
       Startet eine neue Claude Code Sitzung.
       • Standard-Arbeitsverzeichnis: Aktuelles Verzeichnis
       • Standard-Laufzeit: 12 Stunden (automatische Löschung nach Ablauf)
       • Bypass-Permissions (--dangerously-skip-permissions) automatisch aktiv.
+      • Option {CYAN}--resume{RESET} / {CYAN}-r{RESET}: Setzt vorherige Sitzung fort.
+
+  {GREEN}ClaudeM resume [Pfad] [--hours H]{RESET}
+      Setzt die letzte Claude Code Sitzung fort (--resume).
 
   {GREEN}ClaudeM list{RESET} (oder {GREEN}ClaudeM List{RESET})
       Listet alle aktuell laufenden Sitzungen inklusive Nummer, Restzeit,
@@ -221,9 +225,10 @@ def cmd_start(args):
     cleanup_expired_sessions(quiet=True)
     sessions = load_sessions()
     
-    # Parse target directory and hours
+    # Parse target directory, hours and resume flag
     target_dir = os.getcwd()
     hours = DEFAULT_TTL_HOURS
+    resume = False
     
     idx = 0
     while idx < len(args):
@@ -235,6 +240,10 @@ def cmd_start(args):
                 continue
             except ValueError:
                 pass
+        elif arg in ["--resume", "-r", "resume"]:
+            resume = True
+            idx += 1
+            continue
         elif not arg.startswith("-"):
             if os.path.isdir(arg):
                 target_dir = os.path.abspath(arg)
@@ -263,11 +272,12 @@ def cmd_start(args):
     
     # Wrapper script inside tmux to handle colors, environment, and error pauses
     # Note: IS_SANDBOX=1 is essential so Claude Code bypasses root-user prevention for --dangerously-skip-permissions!
+    resume_flag = " --resume" if resume else ""
     shell_cmd = (
         f"export IS_SANDBOX=1; "
         f"export TERM=xterm-256color; "
         f"cd {target_dir} && "
-        f"{claude_bin} --dangerously-skip-permissions; "
+        f"{claude_bin} --dangerously-skip-permissions{resume_flag}; "
         f"echo; "
         f"echo -e '{YELLOW}[ClaudeM: Claude Code beendet. Drücke Enter zum Schließen des Fensters]{RESET}'; "
         f"read -r"
@@ -499,6 +509,8 @@ def main():
         cmd_help(args)
     elif command in ["start", "new", "run"]:
         cmd_start(args)
+    elif command in ["resume", "res"]:
+        cmd_start(["--resume"] + args)
     elif command in ["list", "ls", "status"]:
         cmd_list(args)
     elif command in ["renew", "extend"]:
